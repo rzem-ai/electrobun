@@ -73,10 +73,12 @@ const ProgressIndicator = struct {
         // Try zenity first (most common)
         const extract_text = try std.fmt.allocPrint(self.allocator, "--text=Extracting {s}...", .{metadata.name});
         defer self.allocator.free(extract_text);
+        const zenity_title = try std.fmt.allocPrint(self.allocator, "--title={s} Installer", .{metadata.name});
+        defer self.allocator.free(zenity_title);
 
         const zenity_args = [_][]const u8{
-            "zenity",                       "--progress", "--pulsate",    "--no-cancel",
-            "--title=Electrobun Installer", extract_text, "--auto-close",
+            "zenity",      "--progress", "--pulsate", "--no-cancel",
+            zenity_title, extract_text,  "--auto-close",
         };
 
         var child = std.process.Child.init(&zenity_args, self.allocator);
@@ -90,9 +92,12 @@ const ProgressIndicator = struct {
                 const kdialog_text = try std.fmt.allocPrint(self.allocator, "Extracting {s}...", .{metadata.name});
                 defer self.allocator.free(kdialog_text);
 
+                const kdialog_title = try std.fmt.allocPrint(self.allocator, "{s} Installer", .{metadata.name});
+                defer self.allocator.free(kdialog_title);
+
                 const kdialog_args = [_][]const u8{
-                    "kdialog", "--progressbar",        kdialog_text, "0",
-                    "--title", "Electrobun Installer",
+                    "kdialog", "--progressbar",   kdialog_text, "0",
+                    "--title", kdialog_title,
                 };
 
                 var kde_child = std.process.Child.init(&kdialog_args, self.allocator);
@@ -922,22 +927,12 @@ fn escapeDesktopString(allocator: std.mem.Allocator, str: []const u8) ![]u8 {
 }
 
 fn createDesktopShortcut(allocator: std.mem.Allocator, app_dir: []const u8, metadata: AppMetadata) !void {
-    // Get home directory for desktop path
+    // Get home directory
     const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
         std.debug.print("Warning: Could not get HOME directory\n", .{});
         return;
     };
     defer allocator.free(home);
-
-    // Build desktop file path
-    const desktop_dir = try std.fs.path.join(allocator, &.{ home, "Desktop" });
-    defer allocator.free(desktop_dir);
-
-    // Check if Desktop directory exists
-    std.fs.cwd().access(desktop_dir, .{}) catch {
-        std.debug.print("Warning: Desktop directory not found at {s}\n", .{desktop_dir});
-        return;
-    };
 
     // On Linux, look for the launcher binary in the app directory
     const launcher_path = try std.fs.path.join(allocator, &.{ app_dir, "bin", "launcher" });
@@ -953,77 +948,68 @@ fn createDesktopShortcut(allocator: std.mem.Allocator, app_dir: []const u8, meta
     const desktop_filename = try std.fmt.allocPrint(allocator, "{s}.desktop", .{metadata.name});
     defer allocator.free(desktop_filename);
 
-    const desktop_file_path = try std.fs.path.join(allocator, &.{ desktop_dir, desktop_filename });
-    defer allocator.free(desktop_file_path);
-
-    // Look for the desktop file in the extracted app directory and copy it
+    // Build the updated .desktop file content from the template in the app bundle
     var app_dir_handle = try std.fs.cwd().openDir(app_dir, .{ .iterate = true });
     defer app_dir_handle.close();
 
-    var found_desktop_file = false;
-    var iterator = app_dir_handle.iterate();
-    while (try iterator.next()) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".desktop")) {
-            // Copy the desktop file from app dir to Desktop
-            const source_desktop = try std.fs.path.join(allocator, &.{ app_dir, entry.name });
-            defer allocator.free(source_desktop);
+    // Find icon file in app directory (first try root, then Resources subdirectory)
+    var icon_path: []const u8 = undefined;
+    var icon_path_allocated = false;
 
-            // Read the desktop file content
-            const desktop_content = try std.fs.cwd().readFileAlloc(allocator, source_desktop, 4096);
-            defer allocator.free(desktop_content);
+    var icon_iterator = app_dir_handle.iterate();
+    while (try icon_iterator.next()) |icon_entry| {
+        if (icon_entry.kind == .file and std.mem.endsWith(u8, icon_entry.name, ".png")) {
+            icon_path = try std.fs.path.join(allocator, &.{ app_dir, icon_entry.name });
+            icon_path_allocated = true;
+            break;
+        }
+    }
 
-            // Find icon file in app directory (first try root, then Resources subdirectory)
-            var icon_path: []const u8 = undefined;
-            var icon_path_allocated = false;
+    if (!icon_path_allocated) {
+        const resources_path = try std.fs.path.join(allocator, &.{ app_dir, "Resources" });
+        defer allocator.free(resources_path);
 
-            // First, try to find icon in the app root directory
-            var icon_iterator = app_dir_handle.iterate();
-            while (try icon_iterator.next()) |icon_entry| {
+        var resources_dir_handle = std.fs.cwd().openDir(resources_path, .{ .iterate = true }) catch |err| blk: {
+            if (err == error.FileNotFound) break :blk null;
+            return err;
+        };
+
+        if (resources_dir_handle) |*res_handle| {
+            defer res_handle.close();
+            var res_icon_iterator = res_handle.iterate();
+            while (try res_icon_iterator.next()) |icon_entry| {
                 if (icon_entry.kind == .file and std.mem.endsWith(u8, icon_entry.name, ".png")) {
-                    icon_path = try std.fs.path.join(allocator, &.{ app_dir, icon_entry.name });
+                    icon_path = try std.fs.path.join(allocator, &.{ resources_path, icon_entry.name });
                     icon_path_allocated = true;
                     break;
                 }
             }
+        }
+    }
+    defer if (icon_path_allocated) allocator.free(icon_path);
 
-            // If no icon found in root, try Resources subdirectory
-            if (!icon_path_allocated) {
-                const resources_path = try std.fs.path.join(allocator, &.{ app_dir, "Resources" });
-                defer allocator.free(resources_path);
-                
-                var resources_dir_handle = std.fs.cwd().openDir(resources_path, .{ .iterate = true }) catch |err| blk: {
-                    // Resources directory doesn't exist, that's okay
-                    if (err == error.FileNotFound) break :blk null;
-                    return err;
-                };
-                
-                if (resources_dir_handle) |*res_handle| {
-                    defer res_handle.close();
-                    var res_icon_iterator = res_handle.iterate();
-                    while (try res_icon_iterator.next()) |icon_entry| {
-                        if (icon_entry.kind == .file and std.mem.endsWith(u8, icon_entry.name, ".png")) {
-                            icon_path = try std.fs.path.join(allocator, &.{ resources_path, icon_entry.name });
-                            icon_path_allocated = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            defer if (icon_path_allocated) allocator.free(icon_path);
+    // Find and process the .desktop template from the app bundle
+    var desktop_content_result: ?std.ArrayList(u8) = null;
 
-            // Update the Exec and Icon lines in the desktop file
+    var iterator = app_dir_handle.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".desktop")) {
+            const source_desktop = try std.fs.path.join(allocator, &.{ app_dir, entry.name });
+            defer allocator.free(source_desktop);
+
+            const desktop_content = try std.fs.cwd().readFileAlloc(allocator, source_desktop, 4096);
+            defer allocator.free(desktop_content);
+
+            // Update Exec and Icon lines
             var lines = std.mem.tokenize(u8, desktop_content, "\n");
             var result = std.ArrayList(u8).init(allocator);
-            defer result.deinit();
 
             while (lines.next()) |line| {
                 if (std.mem.startsWith(u8, line, "Exec=")) {
-                    // Replace with new Exec line - point to launcher binary
                     try result.appendSlice("Exec=\"");
                     try result.appendSlice(launcher_path);
                     try result.appendSlice("\"\n");
                 } else if (std.mem.startsWith(u8, line, "Icon=") and icon_path_allocated) {
-                    // Replace with new Icon line
                     try result.appendSlice("Icon=");
                     try result.appendSlice(icon_path);
                     try result.appendSlice("\n");
@@ -1033,41 +1019,90 @@ fn createDesktopShortcut(allocator: std.mem.Allocator, app_dir: []const u8, meta
                 }
             }
 
-            // Write the updated desktop file to Desktop
-            const desktop_file = try std.fs.cwd().createFile(desktop_file_path, .{});
-            defer desktop_file.close();
-            try desktop_file.writeAll(result.items);
-
-            found_desktop_file = true;
-            std.debug.print("Copied desktop shortcut to: {s}\n", .{desktop_file_path});
+            desktop_content_result = result;
             break;
         }
     }
 
-    if (!found_desktop_file) {
+    if (desktop_content_result == null) {
         std.debug.print("Warning: No desktop file found in extracted app directory\n", .{});
+        return;
+    }
+    var content = desktop_content_result.?;
+    defer content.deinit();
+
+    // Install to XDG applications directory (app launcher / Activities)
+    const xdg_applications_dir = blk: {
+        const xdg_data_home = std.process.getEnvVarOwned(allocator, "XDG_DATA_HOME") catch {
+            break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share", "applications" });
+        };
+        defer allocator.free(xdg_data_home);
+        break :blk try std.fs.path.join(allocator, &.{ xdg_data_home, "applications" });
+    };
+    defer allocator.free(xdg_applications_dir);
+
+    // Ensure the applications directory exists
+    std.fs.cwd().makePath(xdg_applications_dir) catch |err| {
+        std.debug.print("Warning: Could not create XDG applications directory {s}: {}\n", .{ xdg_applications_dir, err });
+    };
+
+    const xdg_desktop_file_path = try std.fs.path.join(allocator, &.{ xdg_applications_dir, desktop_filename });
+    defer allocator.free(xdg_desktop_file_path);
+
+    xdg_install: {
+        const xdg_file = std.fs.cwd().createFile(xdg_desktop_file_path, .{}) catch |err| {
+            std.debug.print("Warning: Could not create XDG desktop file {s}: {}\n", .{ xdg_desktop_file_path, err });
+            break :xdg_install;
+        };
+        xdg_file.writeAll(content.items) catch |err| {
+            std.debug.print("Warning: Could not write XDG desktop file: {}\n", .{err});
+            xdg_file.close();
+            break :xdg_install;
+        };
+        xdg_file.close();
+
+        // Set executable permission on the XDG desktop file
+        const xdg_path_z = std.fmt.allocPrintZ(allocator, "{s}", .{xdg_desktop_file_path}) catch break :xdg_install;
+        defer allocator.free(xdg_path_z);
+        _ = std.c.chmod(xdg_path_z.ptr, 0o755);
+
+        std.debug.print("Installed desktop entry to: {s}\n", .{xdg_desktop_file_path});
     }
 
-    // Make desktop file executable (required for some desktop environments)
+    // Also try to place on ~/Desktop if it exists
+    const desktop_dir = try std.fs.path.join(allocator, &.{ home, "Desktop" });
+    defer allocator.free(desktop_dir);
+
+    std.fs.cwd().access(desktop_dir, .{}) catch {
+        // No ~/Desktop directory, that's fine — XDG entry is sufficient
+        return;
+    };
+
+    const desktop_file_path = try std.fs.path.join(allocator, &.{ desktop_dir, desktop_filename });
+    defer allocator.free(desktop_file_path);
+
+    const desktop_file = std.fs.cwd().createFile(desktop_file_path, .{}) catch |err| {
+        std.debug.print("Warning: Could not create desktop shortcut {s}: {}\n", .{ desktop_file_path, err });
+        return;
+    };
+    desktop_file.writeAll(content.items) catch |err| {
+        std.debug.print("Warning: Could not write desktop shortcut: {}\n", .{err});
+    };
+    desktop_file.close();
+
+    // Make desktop file executable
     const desktop_file_path_z = try std.fmt.allocPrintZ(allocator, "{s}", .{desktop_file_path});
     defer allocator.free(desktop_file_path_z);
-
-    const result = std.c.chmod(desktop_file_path_z.ptr, 0o755);
-    if (result != 0) {
-        std.debug.print("Warning: Could not set executable permissions on desktop file\n", .{});
-    }
+    _ = std.c.chmod(desktop_file_path_z.ptr, 0o755);
 
     // Try to mark as trusted for GNOME/Ubuntu using gio
     const gio_argv = [_][]const u8{ "gio", "set", desktop_file_path, "metadata::trusted", "true" };
     _ = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &gio_argv,
-    }) catch |err| {
-        std.debug.print("Note: Could not mark desktop file as trusted with gio: {}\n", .{err});
-    };
+    }) catch {};
 
     std.debug.print("Created desktop shortcut: {s}\n", .{desktop_file_path});
-    std.debug.print("Note: If the desktop icon opens as text, right-click it and select 'Allow Launching' or 'Trust and Launch'\n", .{});
 }
 
 fn createWindowsShortcutFile(allocator: std.mem.Allocator, shortcut_dir: []const u8, app_name: []const u8, target_path: []const u8, working_dir: []const u8, icon_path: []const u8) !void {
